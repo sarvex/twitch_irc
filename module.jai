@@ -40,6 +40,7 @@ Twitch_Chat :: struct (Data_Type: Type) {
     verbose:             bool;
 
     socket:              Socket = INVALID_SOCKET;
+    ssl_socket:          *SSL;
     last_message_time:   Apollo_Time = APOLLO_TIME_INVALID;
 
     #if OS == .LINUX {
@@ -131,7 +132,93 @@ deinit :: (s: *$T/Twitch_Chat) {
 	array_free(s.buffer);
 }
 
-connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
+drain_ssl_error_queue :: (label: string) {
+    error := ERR_get_error();
+    while error != 0 {
+        log_error("SSL ERROR: %: %", label, to_string(ERR_error_string(error, null)));
+        error = ERR_get_error();
+    }
+}
+
+// TODO(tsoding): it would be better to dispatch between SSL and plain connection at compile time instead of runtime like in here.
+// It's usually something we know we want to do upfront unless we plan to have some sort of fallback to plain connection
+// in case SSL does not work for some reason. But I don't think we wanna do that in here because we are sending sensitive
+// information over the connection. So if SSL does not work it's better to not send anything at all.
+send :: (s: *$T/Twitch_Chat, buf: *u8, len: int) -> (bytes_sent: int, ok: bool) {
+    if s.ssl_socket {
+        result := SSL_write(s.ssl_socket, buf, cast(s32) len);
+        if result <= 0 {
+            log_error("SSL_write: could not send message");
+            // TODO(tsoding): draining SSL error queue might not be enough, we should probably consult errno as well (check OpenSSL docs on SSL_write for more info)
+            drain_ssl_error_queue("SSL_write");
+            return 0, false;
+        }
+        return result, true;
+    } else {
+        result := send(s.socket, buf, cast(u64) len, 0);
+        if result == -1 {
+            error_code, error_string := get_error_value_and_string();
+            log_error("send: Could not send message: % %", error_code, error_string);
+            return 0, false;
+        }
+        return result, true;
+    }
+}
+
+Recv_Result :: enum {
+    OK;
+    AGAIN;
+    CLOSED;
+    ERROR;
+}
+
+recv :: (s: *$T/Twitch_Chat, buf: *u8, len: int) -> (bytes_received: int, result: Recv_Result) {
+    if s.ssl_socket {
+        bytes_received := SSL_read(s.ssl_socket, buf, cast(s32) len);
+        if bytes_received <= 0 {
+            error_code := SSL_get_error(s.ssl_socket, bytes_received);
+            if error_code == SSL_ERROR_WANT_READ {
+                // Nothing to read
+                return 0, .AGAIN;
+            }
+
+            if error_code == SSL_ERROR_ZERO_RETURN {
+                log_error("SSL_read: socket % was closed by the other side", s.socket);
+                return 0, .CLOSED;
+            }
+
+            // TODO(tsoding): draining SSL error queue might not be enough, we should probably consult errno as well (check OpenSSL docs on SSL_read for more info)
+            log_error("SSL_read: could not read from_socket");
+            drain_ssl_error_queue("SSL_read");
+
+            return 0, .ERROR;
+        }
+
+        return bytes_received, .OK;
+    } else {
+        bytes_received := recv(s.socket, buf, cast(u64) len, 0);
+        if bytes_received == -1 {
+            error_code := errno();
+            if error_code == EAGAIN || error_code == EWOULDBLOCK {
+                // Nothing to read
+                return 0, .AGAIN;
+            }
+
+            error_string := get_error_string(error_code);
+            log_error("recv: Could not read from socket: % %", error_code, error_string);
+            return 0, .ERROR;
+        }
+
+        if bytes_received == 0 {
+            log_error("recv: Socket % was closed by the other side", s.socket);
+            return 0, .CLOSED;
+        }
+
+        return bytes_received, .OK;
+    }
+}
+
+connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667", ssl_ctx : *SSL_CTX = null) -> bool {
     if s.verbose then log("Connecting to %:% as %…", hostname, port, nickname);
 	// Create socket
     s.socket = socket(AF_INET, .STREAM, .TCP);
@@ -222,6 +309,37 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
         if error_code != EINPROGRESS && error_code != EALREADY {
             error_string := get_error_string(error_code);
             log_error("Could not connect to host %:%: % %", hostname, port, error_code, error_string);
+            disconnect(s);
+            return false;
+        }
+    }
+
+    if ssl_ctx != null {
+        s.ssl_socket = SSL_new(ssl_ctx);
+        if s.ssl_socket == null {
+            drain_ssl_error_queue("SSL_new");
+            disconnect(s);
+            return false;
+        }
+
+        if !SSL_set_fd(s.ssl_socket, s.socket) {
+            drain_ssl_error_queue("SSL_set_fd");
+            disconnect(s);
+            return false;
+        }
+
+        // TODO(tsoding): we need to do this weird gymnastics because the underlying socket is non-blocking.
+        // Can we make it non-blocking after we have connected?
+        while true {
+            result := SSL_connect(s.ssl_socket);
+            if result == 1 break;
+            code := SSL_get_error(s.ssl_socket, result);
+            if code == SSL_ERROR_WANT_READ continue;
+            if code == SSL_ERROR_WANT_WRITE continue;
+
+            log_error("SSL_connect: could not connect");
+            // TODO(tsoding): draining SSL error queue might not be enough, we should probably consult errno as well (check OpenSSL docs on SSL_connect for more info)
+            drain_ssl_error_queue("SSL_connect");
             disconnect(s);
             return false;
         }
@@ -419,46 +537,39 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
 read_and_process_data :: (s: *$T/Twitch_Chat) -> bool {
     // Fetch and process all available data from the socket
     while true {
-        bytes_received := recv(s.socket, s.buffer.data + s.unconsumed_bytes, cast(u64) (s.buffer.count - s.unconsumed_bytes), 0);
-        if bytes_received == -1 {
-            error_code := errno();
-            if error_code == EAGAIN || error_code == EWOULDBLOCK {
-                // Nothing to read
-                break;
+        bytes_received, result := recv(s, s.buffer.data + s.unconsumed_bytes, s.buffer.count - s.unconsumed_bytes);
+        if #complete result == {
+            case .AGAIN; break;
+            case .CLOSED; return false;
+            case .ERROR; {
+                // TODO(tsoding): we may actually wanna move all this error handling inside of recv
+                s.error = .SOCKET_RECV;
+                // We were connected but now seem to be disconnected?
+                if is_connected(s) && !socket_is_connected(s.socket) {
+                    // TODO(tsoding): we need SSL aware socket_is_connected() here
+                    // because there might be situations when SSL connection is closed,
+                    // but the underlying transport socket is not.
+                    disconnect(s);
+                }
+
+                return false;
             }
+            case .OK; {
+                s.last_message_time = current_time_monotonic();
 
-            error_string := get_error_string(error_code);
-            log_error("Could not read from socket: % %", error_code, error_string);
-            s.error = .SOCKET_RECV;
-            
-            // We were connected but now seem to be disconnected?
-            if is_connected(s) && !socket_is_connected(s.socket) {
-                disconnect(s);
+                s.unconsumed_bytes += bytes_received;
+
+                success, bytes_consumed := process_data(s, array_view(s.buffer, 0, s.unconsumed_bytes));
+                s.unconsumed_bytes -= bytes_consumed;
+
+                // @ToDo: should be a memmove! But we don't have that yet?
+                for i: 0..s.unconsumed_bytes-1 {
+                    s.buffer[i] = s.buffer[bytes_consumed + i];
+                }
+
+                if !success then return false;
             }
-
-            return false;
         }
-
-        // if s.verbose then log("Read % bytes", bytes_received);
-
-        if bytes_received == 0 {
-            log_error("Socket % was closed by the other side", s.socket);
-            return false;
-        }
-
-        s.last_message_time = current_time_monotonic();
-
-        s.unconsumed_bytes += bytes_received;
-
-        success, bytes_consumed := process_data(s, array_view(s.buffer, 0, s.unconsumed_bytes));
-        s.unconsumed_bytes -= bytes_consumed;
-
-        // @ToDo: should be a memmove! But we don't have that yet?
-        for i: 0..s.unconsumed_bytes-1 {
-            s.buffer[i] = s.buffer[bytes_consumed + i];
-        }
-
-        if !success then return false;
     }
 
     return true;
@@ -748,16 +859,14 @@ send_message :: (s: *$T/Twitch_Chat, message: string) -> success: bool {
     remainder := message;
     while remainder {
         // Actually send the message
-        result := send(s.socket, message.data, cast(u64) message.count, 0);
-        if result == -1 {
-            error_code, error_string := get_error_value_and_string();
-            // Let’s not doxx ourselves
+        bytes_sent, ok := send(s, message.data, message.count);
+        if !ok {
             safe_message := get_message_safe_for_logging(s, message);
             safe_remainder := slice(safe_message, message.count - remainder.count, remainder.count);
-            log_error("Could not send message: % %\n\tRemaining message was: %", error_code, error_string, safe_remainder);
+            log_error("Remaining message was: %", safe_remainder);
             return false;
         }
-        remainder = slice(remainder, result, remainder.count - result);
+        remainder = slice(remainder, bytes_sent, remainder.count - bytes_sent);
     }
 
     return true;
@@ -782,6 +891,13 @@ disconnect :: (s: *$T/Twitch_Chat) {
     if s.verbose then log("Disconnecting…");
     s.status = .DISCONNECTED;
     #if OS == .LINUX {
+        if s.ssl_socket {
+            // TODO(tsoding): These SSL calls may fail. We probably want to handle their errors.
+            SSL_set_shutdown(s.ssl_socket, SSL_RECEIVED_SHUTDOWN | SSL_SENT_SHUTDOWN);
+            SSL_shutdown(s.ssl_socket);
+            SSL_free(s.ssl_socket);
+            s.ssl_socket = null;
+        }
         close_and_reset(*s.epoll_handle);
     }
     #if OS == .MACOS {
@@ -902,6 +1018,7 @@ unescape :: (value_pointer: *string) {
 // }
 
 #load "commands.jai";
+#load "ssl.jai";
 
 #import "Basic";
 #import "Socket";
